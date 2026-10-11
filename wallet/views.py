@@ -35,7 +35,6 @@ class RechargeInitiateView(APIView):
     def post(self, request):
         serializer = RechargeSerializer(data=request.data)
         if serializer.is_valid():
-            # check if reference already exists
             if RechargeTransaction.objects.filter(
                 reference=serializer.validated_data['reference']
             ).exists():
@@ -81,7 +80,6 @@ class RechargeCallbackView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # Idempotency check - if already processed, return OK
         if txn.status in ('success', 'failed'):
             return Response({
                 'message': 'Transaction already processed',
@@ -90,12 +88,10 @@ class RechargeCallbackView(APIView):
             })
 
         with transaction.atomic():
-            # lock the row to prevent race conditions
             txn = RechargeTransaction.objects.select_for_update().get(
                 reference=reference
             )
 
-            # double-check after acquiring lock
             if txn.status != 'pending':
                 return Response({
                     'message': 'Transaction already processed',

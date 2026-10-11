@@ -71,26 +71,6 @@ Open your browser at:
 | PATCH | `/api/sessions/{id}/end/` | Manually end consultation session |
 | PATCH | `/api/sessions/{id}/cancel/` | Cancel session prior to start |
 
----
-
-## Session State Machine
-
-```
-unassigned ──→ assigned ──→ accepted_by_provider ──→ in_progress ──→ completed
-     │              │                  │
-     └──────────────┴──────────────────┘
-                    ↓
-                cancelled
-```
-
-- **`unassigned` ➔ `assigned`**: Client assigns provider.
-- **`assigned` ➔ `accepted_by_provider`**: Provider accepts assigned session.
-- **`accepted_by_provider` ➔ `in_progress`**: Client starts session. Requires prepaid balance covering at least **5 minutes** of consultation.
-- **`in_progress` ➔ `completed`**: Ended manually by client/provider or automatically by system upon balance exhaustion.
-- **Single Active Session Rule**: A user cannot start a new session while another session is in progress.
-
----
-
 ## Database ER Diagram
 
 ```
@@ -127,3 +107,40 @@ unassigned ──→ assigned ──→ accepted_by_provider ──→ in_progre
 │ updated_at          │
 └─────────────────────┘
 ```
+
+## End-to-End Application Flow (How It Works)
+
+Here is a brief step-by-step walkthrough of how the system operates from start to finish:
+
+1. User Registration & Wallet Auto-Creation
+   - A client (`role='user'`) and a provider (`role='provider'`) register via `POST /api/accounts/register/`.
+   - A Django `post_save` signal triggers immediately upon registration to automatically create a dedicated, zero-balance `Wallet` for each new user.
+
+2. Authentication & Token Authorization
+   - Users authenticate via `POST /api/accounts/login/` and receive a DRF authentication token.
+   - For all protected endpoints, the client passes the header `Authorization: Token <key>` (in Swagger UI, click 'Authorize' at the top right and enter `Token <your_token>`).
+
+3. Prepaid Wallet Recharge
+   - The user initiates a wallet recharge via `POST /api/wallet/recharge/` specifying the amount and a unique reference. The transaction starts in `pending` status.
+   - The mock payment gateway callback `POST /api/wallet/recharge/callback/` marks the transaction `success` and atomically credits the user's wallet balance using database row locks (`select_for_update()`).
+   - Duplicate callbacks are idempotent: re-submitting the same reference will safely acknowledge without double-crediting.
+
+4. Booking & Provider Acceptance
+   - The user creates a consultation request via `POST /api/sessions/` with a defined `per_minute_cost` (session state: `unassigned`).
+   - The user assigns a provider via `PATCH /api/sessions/{id}/assign/` (session state: `assigned`).
+   - The provider accepts the request via `PATCH /api/sessions/{id}/accept/` (session state: `accepted_by_provider`).
+
+5. Starting the Session (Minimum Balance Barrier)
+   - The user starts the session via `PATCH /api/sessions/{id}/start/`.
+   - Enforcement Check: The system verifies the user has enough prepaid balance to cover at least 5 full minutes (`balance >= 5 * per_minute_cost`) and does not already have another session in progress.
+   - If verified, the session enters `in_progress` and the start timestamp (`started_at`) is captured.
+
+6. Per-Minute Billing & Idempotent Deductions
+   - While the session runs, per-minute billing is processed via `POST /api/sessions/{id}/billing/`.
+   - The system calculates elapsed minutes since `started_at` against the count of already billed minutes.
+   - For each elapsed minute, the system deducts the `per_minute_cost` from the wallet and inserts a `BillingRecord`.
+   - Duplicate Billing Protection: A database `unique_together` constraint on `(session, minute_number)` guarantees that the exact same minute can never be billed twice.
+
+7. Session Completion (Manual or Auto-Termination)
+   - Manual End: Either the user or provider calls `PATCH /api/sessions/{id}/end/` to conclude the consultation (`status='completed'`, `ended_by='user'` or `'provider'`).
+   - Auto-End on Low Balance: If at any point during billing the wallet balance is insufficient to cover the upcoming minute, the system terminates the session automatically (`status='completed'`, `ended_by='system'`, `end_reason='Insufficient Balance'`), ensuring the wallet balance never drops below zero.
